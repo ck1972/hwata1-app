@@ -7,7 +7,8 @@ Original file is located at
     https://colab.research.google.com/drive/19fjdApKHRJrcXujeXRJ8W3nHIXdzN2UR
 """
 
-# HWATA 1: Streamlit App for Regularized Building Footprint Extraction
+# hwata1a.py
+# HWATA 1: Streamlit App for Regularized Building Footprint Extraction (no gdown)
 
 import os
 import hashlib
@@ -21,28 +22,33 @@ import numpy as np
 import torch
 from rasterio import features
 import segmentation_models_pytorch as smp
-from shapely.geometry import shape  # (kept in case you use it elsewhere)
 from buildingregulariser import regularize_geodataframe
 import folium
 from streamlit_folium import st_folium
 
-# ---------- CONFIGURE YOUR MODEL SOURCE ----------
-# Prefer a public GitHub Release asset URL like:
-# https://github.com/<OWNER>/<REPO>/releases/download/<TAG>/pretrained_unet_building_segmentation.pth
-MODEL_URL = "https://github.com/ck1972/hwata1-app/releases/download/v0.1.0/pretrained_unet_building_segmentation.pth"
+
+# ====================== CONFIG ======================
+# Public GitHub Release asset URL (change if your tag/filename differ)
+MODEL_URL = (
+    "https://github.com/ck1972/hwata1-app/releases/download/"
+    "v0.1.0/pretrained_unet_building_segmentation.pth"
+)
 MODEL_PATH = "pretrained_unet_building_segmentation.pth"
-# Optional integrity check (paste your SHA-256 hexdigest if you have it)
-MODEL_SHA256 = ""  # e.g., "a1b2c3..."; leave "" to skip
 
-# If your release is private, set a token in Streamlit Secrets:
-# st.secrets["GITHUB_TOKEN"] and requests will send the header.
+# Optional: integrity check (paste the real SHA-256 of your .pth)
+MODEL_SHA256 = ""  # e.g., "a4b2c3..."; leave "" to skip
 
-# ---------- STREAMLIT PAGE ----------
+
+# ====================== PAGE ======================
 st.set_page_config(page_title="HWATA 1 – GeoAI Feature Extractor", layout="centered")
 st.title("🏠 HWATA 1 – Building Footprint Extractor")
-st.markdown("Upload a 30 cm satellite or aerial image (GeoTIFF), and HWATA 1 will extract regularized building footprints as GeoJSON.")
+st.markdown(
+    "Upload a 30 cm satellite or aerial image (GeoTIFF), and HWATA 1 will "
+    "extract **regularized** building footprints as GeoJSON."
+)
 
-# ---------- HELPERS ----------
+
+# ====================== HELPERS ======================
 def _sha256(path: str) -> str:
     h = hashlib.sha256()
     with open(path, "rb") as f:
@@ -50,21 +56,25 @@ def _sha256(path: str) -> str:
             h.update(chunk)
     return h.hexdigest()
 
+
 @st.cache_resource
 def fetch_model_file() -> str:
-    """Download the model from MODEL_URL if missing; return local path."""
+    """
+    Ensure MODEL_PATH exists locally; download from GitHub Release if missing
+    (or if checksum fails). Returns the local path.
+    """
     if os.path.exists(MODEL_PATH):
         if MODEL_SHA256:
-            try:
-                assert _sha256(MODEL_PATH) == MODEL_SHA256, "Model checksum mismatch"
-            except AssertionError as e:
-                # Redownload if checksum fails
-                os.remove(MODEL_PATH)
+            if _sha256(MODEL_PATH) == MODEL_SHA256:
+                return MODEL_PATH
+            # if checksum mismatch, re-download
+            os.remove(MODEL_PATH)
         else:
             return MODEL_PATH
 
-    st.info("Downloading model…")
+    st.info("Downloading model from GitHub Releases…")
     headers = {}
+    # For private releases, add a token in Streamlit Secrets
     if "GITHUB_TOKEN" in st.secrets:
         headers["Authorization"] = f"Bearer {st.secrets['GITHUB_TOKEN']}"
 
@@ -81,31 +91,39 @@ def fetch_model_file() -> str:
 
     return MODEL_PATH
 
+
 @st.cache_resource
 def load_model(model_path: str, device: torch.device):
+    """
+    Build UNet, load weights, set eval, and cache the instance.
+    """
     model = smp.Unet(
         encoder_name="resnet34",
         encoder_weights="imagenet",
         in_channels=3,
-        classes=1
+        classes=1,
     ).to(device)
-    state = torch.load(model_path, map_range=None, map_location=device) if hasattr(torch, "load") else torch.load(model_path, map_location=device)
+    state = torch.load(model_path, map_location=device)
     model.load_state_dict(state)
     model.eval()
     return model
 
+
 def quick_raster_probe(path: str):
-    """Show minimal info so we know raster I/O is fine."""
+    """
+    Return basic raster info to help pinpoint I/O issues fast.
+    """
     with rasterio.open(path) as src:
         return {
             "width": src.width,
             "height": src.height,
             "bands": src.count,
             "dtype": src.dtypes[0],
-            "crs": str(src.crs)
+            "crs": str(src.crs),
         }
 
-# ---------- UI: FILE UPLOAD ----------
+
+# ====================== UI: FILE UPLOAD ======================
 uploaded_img = st.file_uploader("📂 Upload 30 cm Image (GeoTIFF)", type=["tif", "tiff"])
 
 if uploaded_img:
@@ -113,9 +131,9 @@ if uploaded_img:
         tmp_img.write(uploaded_img.read())
         tmp_img_path = tmp_img.name
 
-    st.success("✅ Image uploaded. Running prediction...")
+    st.success("✅ Image uploaded. Running prediction…")
 
-    # Probe the raster (helps pinpoint failures quickly)
+    # --- Probe raster (fast feedback if file is invalid) ---
     try:
         info = quick_raster_probe(tmp_img_path)
         st.caption(f"Raster info → {info}")
@@ -124,26 +142,40 @@ if uploaded_img:
         os.remove(tmp_img_path)
         st.stop()
 
-    # Load image
+    # --- Load raster ---
     with rasterio.open(tmp_img_path) as src:
-        image = src.read([1, 2, 3])  # Use only RGB
+        # Use only RGB channels for this model
+        image = src.read([1, 2, 3])
         transform = src.transform
         height, width = src.height, src.width
         raster_crs = src.crs
 
+    # Normalize to [0,1] float32
     image = image.astype(np.float32) / 255.0
 
-    # Ensure model exists (no gdown)
+    # --- Ensure model file is present (no gdown) ---
     try:
         model_path = fetch_model_file()
         st.success("✅ Model ready")
+        st.caption(
+            {
+                "model_path": model_path,
+                "exists": os.path.exists(model_path),
+                "size_bytes": os.path.getsize(model_path)
+                if os.path.exists(model_path)
+                else 0,
+            }
+        )
     except Exception as e:
         st.error(f"Model fetch failed ❌: {e}")
-        st.info("If your release is private, add GITHUB_TOKEN to Streamlit Secrets.")
+        st.info(
+            "If the release is private, add GITHUB_TOKEN in Streamlit Secrets "
+            "and redeploy."
+        )
         os.remove(tmp_img_path)
         st.stop()
 
-    # Load model
+    # --- Load model ---
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     try:
         model = load_model(model_path, device)
@@ -152,43 +184,55 @@ if uploaded_img:
         os.remove(tmp_img_path)
         st.stop()
 
-    # Predict mask (sliding window)
+    # --- Predict mask (simple sliding window over non-overlapping tiles) ---
     patch_size = 256
     full_pred_mask = np.zeros((height, width), dtype=np.uint8)
 
     with torch.no_grad():
         for i in range(0, height - patch_size + 1, patch_size):
             for j in range(0, width - patch_size + 1, patch_size):
-                patch = image[:, i:i+patch_size, j:j+patch_size]
+                patch = image[:, i : i + patch_size, j : j + patch_size]
                 if patch.shape[1:] != (patch_size, patch_size):
                     continue
-                patch_tensor = torch.tensor(patch, dtype=torch.float32).unsqueeze(0).to(device)
+                patch_tensor = torch.from_numpy(patch).float().unsqueeze(0).to(device)
                 output = torch.sigmoid(model(patch_tensor))
                 pred_patch = (output.squeeze().cpu().numpy() > 0.5).astype(np.uint8)
-                full_pred_mask[i:i+patch_size, j:j+patch_size] = pred_patch
+                full_pred_mask[i : i + patch_size, j : j + patch_size] = pred_patch
 
-    st.success("✅ Prediction completed. Converting to GeoJSON...")
+    st.success("✅ Prediction completed. Converting to GeoJSON…")
 
-    # Convert mask to polygons
+    # --- Raster mask → polygons ---
     results = (
-        {'properties': {'raster_val': v}, 'geometry': s}
-        for s, v in features.shapes(full_pred_mask.astype(np.int16), transform=transform)
+        {"properties": {"raster_val": v}, "geometry": s}
+        for s, v in features.shapes(
+            full_pred_mask.astype(np.int16), transform=transform
+        )
         if v == 1
     )
     gdf_pred = gpd.GeoDataFrame.from_features(list(results), crs=raster_crs)
 
-    # Filter and regularize
-    gdf_proj = gdf_pred.to_crs(gdf_pred.estimate_utm_crs())
-    gdf_proj['area_m2'] = gdf_proj.geometry.area
-    gdf_filtered = gdf_proj[gdf_proj['area_m2'] >= 10].to_crs(raster_crs)
-    polygons = regularize_geodataframe(gdf_filtered)
+    # --- Filter small pieces & regularize ---
+    if len(gdf_pred) == 0:
+        st.warning("No building polygons detected. Try a clearer 30 cm image.")
+        os.remove(tmp_img_path)
+        st.stop()
 
-    # Reproject for mapping and export
+    gdf_proj = gdf_pred.to_crs(gdf_pred.estimate_utm_crs())
+    gdf_proj["area_m2"] = gdf_proj.geometry.area
+    gdf_filtered = gdf_proj[gdf_proj["area_m2"] >= 10].to_crs(raster_crs)
+
+    try:
+        polygons = regularize_geodataframe(gdf_filtered)
+    except Exception as e:
+        st.warning(f"Regularization issue (showing unregularized polygons): {e}")
+        polygons = gdf_filtered.copy()
+
+    # Reproject for map/export
     polygons = polygons.to_crs(epsg=4326)
 
     st.success("✅ Building footprints extracted and regularized.")
 
-    # Preview on map
+    # --- Preview on map (optional) ---
     if st.checkbox("🌍 Preview Building Footprints on Google Satellite"):
         st.subheader("🗺️ Interactive Preview")
         bounds = polygons.total_bounds  # [minx, miny, maxx, maxy]
@@ -197,29 +241,32 @@ if uploaded_img:
 
         m = folium.Map(location=[center_lat, center_lon], zoom_start=18)
         folium.TileLayer(
-            tiles='https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}',
-            attr='Google Satellite',
-            name='Google Satellite',
+            tiles="https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}",
+            attr="Google Satellite",
+            name="Google Satellite",
             overlay=False,
-            control=True
+            control=True,
         ).add_to(m)
 
         folium.GeoJson(
             polygons,
             name="Building Footprints",
-            style_function=lambda x: {"color": "cyan", "weight": 1.5, "fillOpacity": 0.3}
+            style_function=lambda x: {"color": "cyan", "weight": 1.5, "fillOpacity": 0.3},
         ).add_to(m)
 
         st_folium(m, width=700, height=500)
 
-    # Download button
-    geojson_str = polygons.to_json()
+    # --- Download GeoJSON ---
     st.subheader("📥 Download Extracted Footprints")
     st.download_button(
         "📄 Download GeoJSON",
-        geojson_str,
+        polygons.to_json(),
         file_name="building_footprints.geojson",
-        mime="application/geo+json"
+        mime="application/geo+json",
     )
 
-    os.remove(tmp_img_path)
+    # Cleanup
+    try:
+        os.remove(tmp_img_path)
+    except Exception:
+        pass
