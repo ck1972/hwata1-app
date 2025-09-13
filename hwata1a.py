@@ -9,6 +9,7 @@ Original file is located at
 
 # hwata1a.py
 # HWATA 1: Streamlit App for Regularized Building Footprint Extraction (no gdown)
+# Robust to checkpoints with 1 or 2 output classes.
 
 import os
 import hashlib
@@ -28,22 +29,19 @@ from streamlit_folium import st_folium
 
 
 # ====================== CONFIG ======================
-# Public GitHub Release asset URL (change if your tag/filename differ)
 MODEL_URL = (
     "https://github.com/ck1972/hwata1-app/releases/download/"
     "v0.1.0/pretrained_unet_building_segmentation.pth"
 )
 MODEL_PATH = "pretrained_unet_building_segmentation.pth"
-
-# Optional: integrity check (paste the real SHA-256 of your .pth)
-MODEL_SHA256 = ""  # e.g., "a4b2c3..."; leave "" to skip
+MODEL_SHA256 = ""  # optional; paste your real sha256 to verify downloads
 
 
 # ====================== PAGE ======================
 st.set_page_config(page_title="HWATA 1 – GeoAI Feature Extractor", layout="centered")
 st.title("🏠 HWATA 1 – Building Footprint Extractor")
 st.markdown(
-    "Upload a 30 cm satellite or aerial image (GeoTIFF), and HWATA 1 will "
+    "Upload a 30 cm satellite or aerial image (GeoTIFF) and HWATA 1 will "
     "extract **regularized** building footprints as GeoJSON."
 )
 
@@ -59,23 +57,18 @@ def _sha256(path: str) -> str:
 
 @st.cache_resource
 def fetch_model_file() -> str:
-    """
-    Ensure MODEL_PATH exists locally; download from GitHub Release if missing
-    (or if checksum fails). Returns the local path.
-    """
+    """Ensure MODEL_PATH exists locally; download from GitHub Release if missing."""
     if os.path.exists(MODEL_PATH):
         if MODEL_SHA256:
             if _sha256(MODEL_PATH) == MODEL_SHA256:
                 return MODEL_PATH
-            # if checksum mismatch, re-download
-            os.remove(MODEL_PATH)
+            os.remove(MODEL_PATH)  # re-download if checksum mismatch
         else:
             return MODEL_PATH
 
     st.info("Downloading model from GitHub Releases…")
     headers = {}
-    # For private releases, add a token in Streamlit Secrets
-    if "GITHUB_TOKEN" in st.secrets:
+    if "GITHUB_TOKEN" in st.secrets:  # only needed for private releases
         headers["Authorization"] = f"Bearer {st.secrets['GITHUB_TOKEN']}"
 
     with requests.get(MODEL_URL, headers=headers, stream=True, timeout=120) as r:
@@ -92,27 +85,49 @@ def fetch_model_file() -> str:
     return MODEL_PATH
 
 
+def _infer_num_classes_from_state(state_dict: dict, default: int = 1) -> int:
+    """
+    Try to infer #classes from the segmentation head weight tensor in the checkpoint.
+    Looks for 'segmentation_head.0.weight' which has shape [C_out, C_in, k, k].
+    """
+    w = state_dict.get("segmentation_head.0.weight", None)
+    if w is None and "module.segmentation_head.0.weight" in state_dict:
+        w = state_dict["module.segmentation_head.0.weight"]
+    if isinstance(w, torch.Tensor) and w.ndim == 4:
+        return int(w.shape[0])
+    return default
+
+
 @st.cache_resource
 def load_model(model_path: str, device: torch.device):
     """
-    Build UNet, load weights, set eval, and cache the instance.
+    Build UNet with the correct #classes inferred from the checkpoint, load weights, eval().
     """
+    raw_state = torch.load(model_path, map_location="cpu")  # load on CPU first
+    # Some training scripts wrap the state under a 'state_dict' key
+    if isinstance(raw_state, dict) and "state_dict" in raw_state:
+        state_dict = raw_state["state_dict"]
+    else:
+        state_dict = raw_state
+
+    num_classes = _infer_num_classes_from_state(state_dict, default=1)
+
     model = smp.Unet(
         encoder_name="resnet34",
         encoder_weights="imagenet",
         in_channels=3,
-        classes=1,
+        classes=num_classes,          # <-- match checkpoint
+        activation=None,              # we'll handle sigmoid/softmax manually
     ).to(device)
-    state = torch.load(model_path, map_location=device)
-    model.load_state_dict(state)
+
+    # Load weights (allow strict load; should match now that classes align)
+    model.load_state_dict(state_dict, strict=True)
     model.eval()
-    return model
+    return model, num_classes
 
 
 def quick_raster_probe(path: str):
-    """
-    Return basic raster info to help pinpoint I/O issues fast.
-    """
+    """Return basic raster info to help pinpoint file issues quickly."""
     with rasterio.open(path) as src:
         return {
             "width": src.width,
@@ -121,6 +136,23 @@ def quick_raster_probe(path: str):
             "dtype": src.dtypes[0],
             "crs": str(src.crs),
         }
+
+
+def logits_to_building_prob(logits: torch.Tensor) -> torch.Tensor:
+    """
+    Convert model logits to a single-channel building probability map.
+    - If logits.shape[1] == 1 → sigmoid
+    - If logits.shape[1] == 2 → softmax and take channel 1 as 'building'
+      (assumes channel 0 = background, channel 1 = building)
+    Returns a tensor of shape [B, 1, H, W]
+    """
+    if logits.shape[1] == 1:
+        prob = torch.sigmoid(logits)
+    else:
+        # softmax over channels, keep class-1 (building) as [B,1,H,W]
+        prob1 = torch.softmax(logits, dim=1)[:, 1:2, ...]
+        prob = prob1
+    return prob
 
 
 # ====================== UI: FILE UPLOAD ======================
@@ -139,7 +171,10 @@ if uploaded_img:
         st.caption(f"Raster info → {info}")
     except Exception as e:
         st.error(f"Raster read failed ❌: {e}")
-        os.remove(tmp_img_path)
+        try:
+            os.remove(tmp_img_path)
+        except Exception:
+            pass
         st.stop()
 
     # --- Load raster ---
@@ -153,10 +188,9 @@ if uploaded_img:
     # Normalize to [0,1] float32
     image = image.astype(np.float32) / 255.0
 
-    # --- Ensure model file is present (no gdown) ---
+    # --- Ensure model file is present ---
     try:
         model_path = fetch_model_file()
-        st.success("✅ Model ready")
         st.caption(
             {
                 "model_path": model_path,
@@ -168,23 +202,26 @@ if uploaded_img:
         )
     except Exception as e:
         st.error(f"Model fetch failed ❌: {e}")
-        st.info(
-            "If the release is private, add GITHUB_TOKEN in Streamlit Secrets "
-            "and redeploy."
-        )
-        os.remove(tmp_img_path)
+        try:
+            os.remove(tmp_img_path)
+        except Exception:
+            pass
         st.stop()
 
-    # --- Load model ---
+    # --- Load model (now robust to 1 vs 2 classes) ---
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     try:
-        model = load_model(model_path, device)
+        model, num_classes = load_model(model_path, device)
+        st.success(f"✅ Model ready (classes={num_classes})")
     except Exception as e:
         st.error(f"Model load failed ❌: {e}")
-        os.remove(tmp_img_path)
+        try:
+            os.remove(tmp_img_path)
+        except Exception:
+            pass
         st.stop()
 
-    # --- Predict mask (simple sliding window over non-overlapping tiles) ---
+    # --- Predict mask (sliding window, non-overlapping tiles) ---
     patch_size = 256
     full_pred_mask = np.zeros((height, width), dtype=np.uint8)
 
@@ -195,8 +232,9 @@ if uploaded_img:
                 if patch.shape[1:] != (patch_size, patch_size):
                     continue
                 patch_tensor = torch.from_numpy(patch).float().unsqueeze(0).to(device)
-                output = torch.sigmoid(model(patch_tensor))
-                pred_patch = (output.squeeze().cpu().numpy() > 0.5).astype(np.uint8)
+                logits = model(patch_tensor)
+                prob = logits_to_building_prob(logits)            # [B,1,H,W]
+                pred_patch = (prob.squeeze().cpu().numpy() > 0.5).astype(np.uint8)
                 full_pred_mask[i : i + patch_size, j : j + patch_size] = pred_patch
 
     st.success("✅ Prediction completed. Converting to GeoJSON…")
@@ -214,7 +252,10 @@ if uploaded_img:
     # --- Filter small pieces & regularize ---
     if len(gdf_pred) == 0:
         st.warning("No building polygons detected. Try a clearer 30 cm image.")
-        os.remove(tmp_img_path)
+        try:
+            os.remove(tmp_img_path)
+        except Exception:
+            pass
         st.stop()
 
     gdf_proj = gdf_pred.to_crs(gdf_pred.estimate_utm_crs())
